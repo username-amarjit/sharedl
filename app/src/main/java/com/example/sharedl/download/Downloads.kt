@@ -24,11 +24,22 @@ object Downloads {
     const val KEY_MODE = "mode"
     const val KEY_TITLE = "title"
     const val KEY_PROGRESS = "progress"
+    const val KEY_PHASE = "phase"
+    const val KEY_DOWNLOADED = "downloaded"
+    const val KEY_TOTAL = "total"
+    const val KEY_SPEED = "speed"
+    const val KEY_ETA = "eta"
+    const val KEY_ITEM = "item"
+    const val KEY_ITEM_COUNT = "item_count"
     const val KEY_URI = "uri"
     const val KEY_MIME = "mime"
     const val KEY_FOLDER = "folder"
     const val KEY_COUNT = "count"
+    const val KEY_SIZE = "size"
     const val KEY_ERROR = "error"
+    const val KEY_ERROR_DETAILS = "error_details"
+    const val KEY_PARTIAL = "partial"
+    const val KEY_LIMITED = "limited"
 
     /** Finds a link in shared or pasted text and queues it. Returns false if there was no valid link. */
     fun enqueueFromText(context: Context, text: CharSequence?, mode: DownloadMode): Boolean {

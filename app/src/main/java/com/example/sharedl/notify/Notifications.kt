@@ -17,7 +17,8 @@ import androidx.work.WorkManager
 import com.example.sharedl.MainActivity
 import com.example.sharedl.R
 import com.example.sharedl.download.MediaStoreSaver
-import java.util.Locale
+import com.example.sharedl.download.ProgressSnapshot
+import com.example.sharedl.util.Formats
 import java.util.UUID
 
 object Notifications {
@@ -48,17 +49,14 @@ object Notifications {
             ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) ==
             PackageManager.PERMISSION_GRANTED
 
-    fun progress(context: Context, workId: UUID, title: String?, percent: Int, etaSeconds: Long): Notification {
-        val text = when {
-            percent < 0 -> context.getString(R.string.status_preparing)
-            etaSeconds > 0 -> context.getString(R.string.status_percent_eta, percent, formatEta(etaSeconds))
-            else -> context.getString(R.string.status_percent, percent)
-        }
+    fun progress(context: Context, workId: UUID, title: String?, snapshot: ProgressSnapshot): Notification {
         val cancel = WorkManager.getInstance(context).createCancelPendingIntent(workId)
+        val percent = snapshot.percent
         return NotificationCompat.Builder(context, CHANNEL_PROGRESS)
             .setSmallIcon(R.drawable.ic_stat_download)
             .setContentTitle(title ?: context.getString(R.string.notification_title_pending))
-            .setContentText(text)
+            .setContentText(Formats.progressHeadline(context, snapshot))   // "45 MB of 120 MB"
+            .setSubText(Formats.progressDetail(context, snapshot))         // "2.3 MB/s, 0:31 left"
             .setProgress(100, percent.coerceAtLeast(0), percent < 0)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -70,23 +68,21 @@ object Notifications {
             .build()
     }
 
-    fun updateProgress(context: Context, id: Int, workId: UUID, title: String?, percent: Int, etaSeconds: Long) {
-        post(context, id, progress(context, workId, title, percent, etaSeconds))
+    fun updateProgress(context: Context, id: Int, workId: UUID, title: String?, snapshot: ProgressSnapshot) {
+        post(context, id, progress(context, workId, title, snapshot))
     }
 
-    fun showSaved(context: Context, id: Int, title: String?, saved: List<MediaStoreSaver.Saved>) {
+    fun showSaved(context: Context, id: Int, title: String?, saved: List<MediaStoreSaver.Saved>, partial: Boolean) {
         val first = saved.firstOrNull() ?: return
-        val text = if (saved.size == 1) {
-            context.getString(R.string.saved_to, first.folder)
-        } else {
-            context.getString(R.string.saved_many_to, saved.size, first.folder)
-        }
+        val summary = Formats.savedSummary(context, first.folder, saved.size, saved.sumOf { it.sizeBytes })
+        val text = if (partial) "$summary\n${context.getString(R.string.partial_note)}" else summary
         // One file: tapping opens it. A whole playlist: tapping opens the app.
         val tapAction = if (saved.size == 1) openFile(context, id, first) else openApp(context)
         val notification = NotificationCompat.Builder(context, CHANNEL_RESULTS)
             .setSmallIcon(R.drawable.ic_stat_download)
             .setContentTitle(title ?: context.getString(R.string.notification_title_done))
-            .setContentText(text)
+            .setContentText(summary)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
             .setContentIntent(tapAction)
             .setAutoCancel(true)
             .build()
@@ -128,16 +124,5 @@ object Notifications {
     private fun post(context: Context, id: Int, notification: Notification) {
         if (!canPost(context)) return
         NotificationManagerCompat.from(context).notify(id, notification)
-    }
-
-    private fun formatEta(seconds: Long): String {
-        val h = seconds / 3600
-        val m = (seconds % 3600) / 60
-        val s = seconds % 60
-        return if (h > 0) {
-            String.format(Locale.ROOT, "%d:%02d:%02d", h, m, s)
-        } else {
-            String.format(Locale.ROOT, "%d:%02d", m, s)
-        }
     }
 }

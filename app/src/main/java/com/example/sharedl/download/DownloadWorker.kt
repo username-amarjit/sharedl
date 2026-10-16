@@ -33,7 +33,6 @@ class DownloadWorker(appContext: Context, params: WorkerParameters) : CoroutineW
 
     @Volatile
     private var title: String? = null
-    private var lastPercent = Int.MIN_VALUE
     private var lastReportAt = 0L
 
     override suspend fun doWork(): Result {
@@ -50,50 +49,61 @@ class DownloadWorker(appContext: Context, params: WorkerParameters) : CoroutineW
         promoteToForeground()
 
         val workDir = File(applicationContext.cacheDir, "downloads/$processId")
+        var asAudio = mode == DownloadMode.AUDIO
         return try {
             workDir.mkdirs()
             YtDlp.ensureInitialized(applicationContext)
 
             val probe = runInterruptible(Dispatchers.IO) {
-                YtDlp.probe(applicationContext, url, probeProcessId)
+                YtDlp.probe(applicationContext, url, asAudio, settings, probeProcessId)
             }
             title = probe.title
-            val asAudio = mode == DownloadMode.AUDIO || probe.audioOnly
-            report(progress = -1f, etaSeconds = 0)
+            asAudio = asAudio || probe.audioOnly
+            // In AUTO mode the probe sized the video formats. For a link with no video,
+            // that's the same audio file the download will fetch, so the size still holds.
+            val tracker = ProgressTracker(expectedTotalBytes = probe.totalBytes)
+            publish(tracker.snapshot(), force = true)
 
             val request = YtDlp.downloadRequest(applicationContext, url, asAudio, settings, workDir)
             runInterruptible(Dispatchers.IO) {
                 YoutubeDL.getInstance().execute(
                     request,
                     processId = processId,
-                    callback = { progress, eta, _ -> report(progress, eta) },
+                    callback = { percent, _, line -> onOutput(tracker, line, percent) },
                 )
             }
 
             val files = YtDlp.outputFiles(workDir)
             if (files.isEmpty()) throw IOException("yt-dlp finished without writing a file")
-            val saved = files.map { MediaStoreSaver.save(applicationContext, it) }
-
-            Notifications.showSaved(applicationContext, resultNotificationId, title, saved)
-            val first = saved.first()
-            Result.success(
-                workDataOf(
-                    Downloads.KEY_TITLE to title,
-                    Downloads.KEY_URI to first.uri.toString(),
-                    Downloads.KEY_MIME to first.mimeType,
-                    Downloads.KEY_FOLDER to first.folder,
-                    Downloads.KEY_COUNT to saved.size,
-                )
-            )
+            saveAndFinish(files, asAudio, partialDetails = null)
         } catch (e: Exception) {
             stopYtDlp()
             if (e is CancellationException) throw e
             if (isStopped) throw CancellationException("Download cancelled")
 
             if (BuildConfig.DEBUG) Log.w(TAG, "Download failed", e)
+            val details = ErrorMessages.details(e, workDir)
+
+            // yt-dlp sometimes fails in a finishing step (adding metadata or album art, converting)
+            // after the media itself downloaded fine. Keep that file instead of throwing it away.
+            val rescued = if (ErrorMessages.isPostProcessingError(e)) YtDlp.finishedFiles(workDir) else emptyList()
+            if (rescued.isNotEmpty()) {
+                try {
+                    return saveAndFinish(rescued, asAudio, partialDetails = details)
+                } catch (saveError: Exception) {
+                    if (BuildConfig.DEBUG) Log.w(TAG, "Couldn't save the rescued file", saveError)
+                }
+            }
+
             val message = ErrorMessages.forUser(applicationContext, e)
             Notifications.showFailed(applicationContext, resultNotificationId, title, message)
-            Result.failure(workDataOf(Downloads.KEY_TITLE to title, Downloads.KEY_ERROR to message))
+            Result.failure(
+                workDataOf(
+                    Downloads.KEY_TITLE to title,
+                    Downloads.KEY_ERROR to message,
+                    Downloads.KEY_ERROR_DETAILS to details,
+                )
+            )
         } finally {
             workDir.deleteRecursively()
             // Only matters if we couldn't become a foreground service and posted progress ourselves.
@@ -101,9 +111,34 @@ class DownloadWorker(appContext: Context, params: WorkerParameters) : CoroutineW
         }
     }
 
+    /** Copies the files to shared storage. [partialDetails] is set when a finishing step failed. */
+    private fun saveAndFinish(files: List<File>, asAudio: Boolean, partialDetails: String?): Result {
+        publish(ProgressSnapshot(Phase.SAVING), force = true)
+        val saved = files.map { MediaStoreSaver.save(applicationContext, it, asAudio) }
+        val partial = partialDetails != null
+
+        Notifications.showSaved(applicationContext, resultNotificationId, title, saved, partial)
+        val first = saved.first()
+        return Result.success(
+            workDataOf(
+                Downloads.KEY_TITLE to title,
+                Downloads.KEY_URI to first.uri.toString(),
+                Downloads.KEY_MIME to first.mimeType,
+                Downloads.KEY_FOLDER to first.folder,
+                Downloads.KEY_COUNT to saved.size,
+                Downloads.KEY_SIZE to saved.sumOf { it.sizeBytes },
+                Downloads.KEY_PARTIAL to partial,
+                Downloads.KEY_LIMITED to !YtDlp.canMerge(applicationContext),
+                Downloads.KEY_ERROR_DETAILS to partialDetails,
+            )
+        )
+    }
+
     private suspend fun promoteToForeground() {
         try {
-            val notification = Notifications.progress(applicationContext, id, title = null, percent = -1, etaSeconds = 0)
+            val notification = Notifications.progress(
+                applicationContext, id, title = null, snapshot = ProgressSnapshot(Phase.PREPARING),
+            )
             setForeground(ForegroundInfo(notificationId, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC))
         } catch (e: CancellationException) {
             throw e
@@ -115,18 +150,21 @@ class DownloadWorker(appContext: Context, params: WorkerParameters) : CoroutineW
         }
     }
 
-    /** Called from yt-dlp's output thread. Throttled so we stay under Android's notification rate limit. */
+    /** Called from yt-dlp's output thread for every line it prints. */
+    private fun onOutput(tracker: ProgressTracker, line: String, libraryPercent: Float) {
+        val phaseChanged = tracker.onLine(line, libraryPercent)
+        publish(tracker.snapshot(), force = phaseChanged)
+    }
+
+    /** Throttled so speed updates stay readable and we stay under Android's notification rate limit. */
     @Synchronized
-    private fun report(progress: Float, etaSeconds: Long) {
-        val percent = if (progress < 0f) -1 else progress.toInt().coerceIn(0, 100)
+    private fun publish(snapshot: ProgressSnapshot, force: Boolean) {
         val now = SystemClock.elapsedRealtime()
-        if (percent == lastPercent) return
-        if (percent in 1..99 && now - lastReportAt < REPORT_INTERVAL_MS) return
-        lastPercent = percent
+        if (!force && now - lastReportAt < REPORT_INTERVAL_MS) return
         lastReportAt = now
 
-        setProgressAsync(workDataOf(Downloads.KEY_TITLE to title, Downloads.KEY_PROGRESS to percent))
-        Notifications.updateProgress(applicationContext, notificationId, id, title, percent, etaSeconds)
+        setProgressAsync(snapshot.toWorkData(title))
+        Notifications.updateProgress(applicationContext, notificationId, id, title, snapshot)
     }
 
     private fun stopYtDlp() {
@@ -136,6 +174,6 @@ class DownloadWorker(appContext: Context, params: WorkerParameters) : CoroutineW
 
     private companion object {
         const val TAG = "DownloadWorker"
-        const val REPORT_INTERVAL_MS = 750L
+        const val REPORT_INTERVAL_MS = 1000L
     }
 }

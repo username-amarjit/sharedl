@@ -19,6 +19,9 @@ class SaveException(message: String, cause: Throwable? = null) : IOException(mes
 object MediaStoreSaver {
 
     private const val APP_FOLDER = "ShareDL"
+    val VIDEO_FOLDER = "${Environment.DIRECTORY_MOVIES}/$APP_FOLDER"
+    val AUDIO_FOLDER = "${Environment.DIRECTORY_MUSIC}/$APP_FOLDER"
+    val OTHER_FOLDER = "${Environment.DIRECTORY_DOWNLOADS}/$APP_FOLDER"
     private const val BUFFER_SIZE = 1 shl 16
 
     private val KNOWN_TYPES = mapOf(
@@ -34,24 +37,25 @@ object MediaStoreSaver {
         "wav" to "audio/wav",
     )
 
-    data class Saved(val uri: Uri, val mimeType: String, val folder: String)
+    data class Saved(val uri: Uri, val mimeType: String, val folder: String, val sizeBytes: Long)
 
-    fun save(context: Context, file: File): Saved {
+    /** [asAudio]: the user asked for audio, so store it as audio even if it ended up in a video container. */
+    fun save(context: Context, file: File, asAudio: Boolean = false): Saved {
         val ext = file.extension.lowercase(Locale.ROOT)
-        val mime = KNOWN_TYPES[ext]
+        var mime = KNOWN_TYPES[ext]
             ?: MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
             ?: "application/octet-stream"
+        // If converting to MP3 failed, the audio can still be sitting in a .webm or .mp4 container.
+        if (asAudio && mime.startsWith("video/")) mime = "audio/" + mime.substringAfter('/')
 
         val volume = MediaStore.VOLUME_EXTERNAL_PRIMARY
         val (collection, folder) = when {
-            mime.startsWith("audio/") ->
-                MediaStore.Audio.Media.getContentUri(volume) to "${Environment.DIRECTORY_MUSIC}/$APP_FOLDER"
-            mime.startsWith("video/") ->
-                MediaStore.Video.Media.getContentUri(volume) to "${Environment.DIRECTORY_MOVIES}/$APP_FOLDER"
-            else ->
-                MediaStore.Downloads.getContentUri(volume) to "${Environment.DIRECTORY_DOWNLOADS}/$APP_FOLDER"
+            mime.startsWith("audio/") -> MediaStore.Audio.Media.getContentUri(volume) to AUDIO_FOLDER
+            mime.startsWith("video/") -> MediaStore.Video.Media.getContentUri(volume) to VIDEO_FOLDER
+            else -> MediaStore.Downloads.getContentUri(volume) to OTHER_FOLDER
         }
 
+        val sizeBytes = file.length()
         val resolver = context.contentResolver
         val pending = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
@@ -71,6 +75,6 @@ object MediaStoreSaver {
             runCatching { resolver.delete(uri, null, null) } // don't leave a half-written file behind
             throw e as? SaveException ?: SaveException("Copy to shared storage failed", e)
         }
-        return Saved(uri, mime, folder)
+        return Saved(uri, mime, folder, sizeBytes)
     }
 }
